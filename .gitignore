@@ -1,2 +1,4 @@
 Lab1/data/*
 *.pth
+Lab2/data/*
+*/__pycache__/*

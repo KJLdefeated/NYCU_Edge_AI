@@ -9,7 +9,32 @@ import numpy as np
 from hqq_utils import AutoHQQHFModel, get_size_of_model
 from hqq.utils.patching import recommended_inductor_config_setter
 
-from quant_cfg import get_quant_config_slm
+from hqq.core.quantize import BaseQuantizeConfig
+from matplotlib import pyplot as plt
+
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 256  # or higher if needed
+
+
+def get_quant_config_slm(model, q_layer):
+    quant_config = {}
+    
+    n_layers = model.config.num_hidden_layers
+    q2_config = BaseQuantizeConfig(nbits=2, group_size=64)
+    q4_config = BaseQuantizeConfig(nbits=4, group_size=64)
+    q8_config = BaseQuantizeConfig(nbits=8, group_size=64)
+    sp = 2
+
+    quant_config[f'model.layers.{q_layer}.self_attn.q_proj'] = q2_config
+    quant_config[f'model.layers.{q_layer}.self_attn.k_proj'] = q2_config
+    quant_config[f'model.layers.{q_layer}.self_attn.v_proj'] = q2_config
+    quant_config[f'model.layers.{q_layer}.self_attn.o_proj'] = q2_config
+    
+    quant_config[f'model.layers.{q_layer}.mlp.gate_proj'] = q2_config
+    quant_config[f'model.layers.{q_layer}.mlp.up_proj'] = q2_config
+    quant_config[f'model.layers.{q_layer}.mlp.down_proj'] = q2_config
+        
+    return quant_config
 
 def generate(model, input_ids, past_key_values, max_new_tokens, activate_timing, verbose=True):
     input_ids = input_ids.clone()
@@ -90,7 +115,7 @@ def evaluate_ppl(model, tokenizer, device="cuda:0"):
     
     return ppl.item()
 
-def main():
+def main(q_layer):
     ############## Set Up ##############
     torch.manual_seed(0)
     random.seed(0)
@@ -114,7 +139,7 @@ def main():
     model.forward = torch.compile(model.forward, mode='max-autotune', dynamic=False, fullgraph=True)
     #####################################
     
-    # Original Model
+    # # Original Model
     warmup_prompt = "Explain what AI is."
     input_ids = tokenizer(warmup_prompt, return_tensors="pt").input_ids.to(device)
     past_key_values = StaticCache(
@@ -136,14 +161,14 @@ def main():
         generated, tput = generate(model, input_ids, past_key_values, max_new_tokens, activate_timing=True, verbose=False)
         past_key_values.reset()
         tputs.append(tput)
-    response = tokenizer.decode(generated[0][input_ids.shape[1]:], skip_special_tokens=True)
+    # response = tokenizer.decode(generated[0][input_ids.shape[1]:], skip_special_tokens=True)
     tputs = np.sort(tputs)[2:-2]
     org_tput = np.mean(tputs)
-    print(f'Prompt: {prompt}\nResponse: {response}\nThroughput: {org_tput} toks/s')
+    # print(f'Prompt: {prompt}\nResponse: {response}\nThroughput: {org_tput} toks/s')
     print(f'Model Size After Quant: {get_size_of_model(model) / (1024 ** 2)} MiB')
     
     # TODO: Quantize    
-    quant_config = get_quant_config_slm(model)
+    quant_config = get_quant_config_slm(model, q_layer)
     
     AutoHQQHFModel.quantize_model(model, quant_config=quant_config, compute_dtype=torch.float16, device=device)
 
@@ -165,10 +190,10 @@ def main():
         generated, tput = generate(model, input_ids, past_key_values, max_new_tokens, activate_timing=True, verbose=False)
         past_key_values.reset()
         tputs.append(tput)
-    response = tokenizer.decode(generated[0][input_ids.shape[1]:], skip_special_tokens=True)
+    # response = tokenizer.decode(generated[0][input_ids.shape[1]:], skip_special_tokens=True)
     tputs = np.sort(tputs)[2:-2]
     quant_tput = np.mean(tputs)
-    print(f'Prompt: {prompt}\nResponse: {response}\nThroughput: {quant_tput} toks/s')
+    # print(f'Prompt: {prompt}\nResponse: {response}\nThroughput: {quant_tput} toks/s')
     print(f'Model Size After Quant: {get_size_of_model(model) / (1024 ** 2)} MiB')
     
     ppl = evaluate_ppl(model, tokenizer, device)
@@ -180,5 +205,45 @@ def main():
     score += 5 if quant_tput / org_tput >= 1.3 else 0
     print(f'Score: {score}')
 
+    return ppl, quant_tput/org_tput, score
+
 if __name__ == '__main__':
-    main()
+    n_layer = 16
+    accs = []
+    sizes = []
+    scores = []
+    for i in range(n_layer):
+        print(f"Quant to 2 bits: {i}")
+        acc, speedup, score = main(i)
+        accs.append(acc)
+        sizes.append(speedup)
+        scores.append(score)
+    # Plotting
+    fig, ax1 = plt.subplots()
+    color = 'tab:red'
+    ax1.set_xlabel('Layer')
+    ax1.set_ylabel('PPL', color=color)
+    ax1.plot(range(n_layer), accs, color=color, label='PPL')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.set_ylim(0, 100)
+    ax1.set_xticks(range(n_layer))
+    ax1.set_xticklabels(range(n_layer), rotation=45)
+    ax1.legend(loc='upper left')
+    ax2 = ax1.twinx()
+    color = 'tab:blue'
+    ax2.set_ylabel('Speed Up', color=color)
+    ax2.plot(range(n_layer), sizes, color=color, label='Speed Up')
+    ax2.tick_params(axis='y', labelcolor=color)
+    ax2.set_ylim(0, 20)
+    ax2.legend(loc='upper right')
+    fig.tight_layout()
+    plt.title('PPL and Speed Up vs Layer (One Layer Quantization)')
+    # Save results
+    results_file = 'slm_per_layer_results.txt'
+    with open(results_file, 'w') as f:
+        for i in range(n_layer):
+            f.write(f"Layer {i}: PPL: {accs[i]}, Speed Up: {sizes[i]}x, Score: {scores[i]}\n")
+    print(f"Results saved to {results_file}")
+    # Save the plot
+    fig.savefig('slm_per_layer_.png')
+    print("Plot saved as accuracy_model_size_vs_layer.png")
